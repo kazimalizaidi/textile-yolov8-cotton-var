@@ -1,0 +1,34 @@
+# Python / environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Generated run artefacts (large, reproducible, or not redistributable)
+runs/
+outputs*/
+run_out/
+review_*/
+class_previews/
+leak_pairs*.png
+box_limits*.json
+confusion_*.json
+prepare_report*.json
+eval_*.json
+results.csv
+sessions*.txt
+*.log
+
+# Model weights and archives
+*.pt
+*.pth
+*.onnx
+*.zip
+
+# Datasets and downloaded data: the IMF cotton series is copyrighted and image data is licensed by its authors.
+# Everything under data/ except its README is generated locally (python -m textile_risk.fetchdata).
+data/defects/
+data/*.csv
+data/SOURCES.txt

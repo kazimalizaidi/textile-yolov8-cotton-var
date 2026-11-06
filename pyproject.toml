@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "textile-risk-platform"
+version = "1.0.0"
+description = "Backend-only textile quality scoring, event-driven supplier hedging and VaR engine"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "pandas>=2.0", "scipy>=1.10"]
+
+[project.optional-dependencies]
+yahoo = ["yfinance>=0.2"]
+vision = ["pillow>=10"]
+train = ["ultralytics>=8.0", "pillow>=10"]
+dev = ["pytest>=7", "pillow>=10"]
+
+[project.scripts]
+textile-risk = "textile_risk.cli:main"
+textile-risk-check = "textile_risk.datacheck:main"
+textile-risk-train = "textile_risk.training:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
