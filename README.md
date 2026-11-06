@@ -268,6 +268,14 @@ Potential enhancements include:
 
 Released under the [MIT License](LICENSE).
 
+---
+
+# 🎧 Project Soundtrack
+
+*This track was on loop while working on this project*
+
+[bipolar - .diedlonely](https://open.spotify.com/track/1uvn7eP1I7mIKGvpsqDcoW?si=6644ce591da448c5)
+
 **Star this repository if you found it interesting!** ⭐
 
 made with ❤️ by **kazim**
