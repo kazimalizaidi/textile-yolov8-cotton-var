@@ -23,7 +23,7 @@ It combines three modules:
 3. **📉 Quantitative VaR Engine** - historical 95% / 99% Value-at-Risk and Expected Shortfall for a Cotton + Polyester book,
    a 20% import-tariff stress test, and a linear-programming hedge optimiser that writes a checksummed JSON config.
 
-Beyond building the system, the project **validates its own results**: it tests the defect model on a held-out shooting session,
+Beyond building the system, the framework **validates its own results**: it tests the defect model on a held-out shooting session,
 documents where the first (optimistic) numbers came from, and states every limitation. See
 [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
