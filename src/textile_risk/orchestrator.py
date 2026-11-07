@@ -13,8 +13,8 @@ from .events import (ConsecutiveSevereDefectDetector, Event, EventType, HedgeCon
                      InMemoryEventBroker, MockSupplierApiClient, Supplier,
                      SupplierHedgeOrchestrator)
 from .datacheck import IMAGE_EXT
-from .quality import (BatchQualityScorer, BatchReport, DefectType, Detection, DetectionIngestor,
-                      FrameGeometry, QualityConfig, YoloV8Simulator, parse_class_map)
+from .quality import (BatchQualityScorer, BatchReport, Detection, DetectionIngestor,
+                      FrameGeometry, QualityConfig, YoloV8Simulator, load_box_limits, parse_class_map)
 from .risk import (COTTON_COL, MIN_OBSERVATIONS, POLYESTER_COL, HedgeConfigWriter, HedgeConstraints,
                    HedgeOptimizer, HistoricalVaREngine, MarketData, MarketDataProvider,
                    TariffShockSpec, TariffStressTester)
@@ -68,6 +68,7 @@ class PlatformConfig:
     frame_width_m: Optional[float] = None  # physical width of fabric visible in one image
     frame_length_m: Optional[float] = None  # physical length of fabric visible in one image
     class_map: str = "figshare"
+    box_limits: Optional[Path] = None  # box_limits.json from `textile-risk-train box-limits`
     detect_conf: float = 0.25
     imgsz: int = 640
 
@@ -102,6 +103,7 @@ class TextileRiskPlatform:
             raise ValueError(f"No images found in {cfg.images_dir}")
         model = YoloV8Detector(cfg.weights, conf=cfg.detect_conf, imgsz=cfg.imgsz)
         class_map = parse_class_map(cfg.class_map)
+        limits = load_box_limits(cfg.box_limits) if cfg.box_limits else None
         missing = sorted(set(model.class_names) - set(class_map))
         if missing:
             raise ValueError(f"Model classes {missing} have no entry in --class-map {cfg.class_map!r}")
@@ -114,7 +116,7 @@ class TextileRiskPlatform:
             for frame_id, path in enumerate(paths):
                 raw, (w, h) = model.detect(path)
                 ing = ingestors.setdefault((w, h), DetectionIngestor(
-                    FrameGeometry(w, h, cfg.frame_width_m, cfg.frame_length_m), self._qcfg, class_map))
+                    FrameGeometry(w, h, cfg.frame_width_m, cfg.frame_length_m), self._qcfg, class_map, limits))
                 for seq_det in ing.ingest(batch_id, frame_id, raw):
                     broker.publish(Event(EventType.DEFECT_DETECTED, {
                         "batch_id": batch_id, "seq": len(all_dets), "frame_id": frame_id,

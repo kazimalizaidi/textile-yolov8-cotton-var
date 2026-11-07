@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from textile_risk.datacheck import inspect_yolo_dataset
-from textile_risk.quality import (FIGSHARE_CLASS_MAP, BatchQualityScorer, DefectType, DetectionIngestor,
+from textile_risk.quality import (FIGSHARE_CLASS_MAP, DefectType, DetectionIngestor,
                                   FrameGeometry, QualityConfig, parse_class_map)
 from textile_risk.training import prepare_dataset
 
@@ -188,3 +188,175 @@ def test_sessions_report_gaps(tmp_path):
     test = rep["splits"]["test"]
     assert test["within_window"]["10s"] == 2          # test photos are 10 s and 4 s from train photos
     assert rep["splits"]["val"]["within_window"]["10s"] == 0
+
+
+def test_confusion_native_vs_merged_and_summary():
+    from textile_risk.training import build_confusion, summarise_confusion
+    # classes: 0 oil, 1 cutting, 2 crack, 3 hole.  GT: crack A, hole B, oil C (never detected)
+    A, B, C = (10, 10, 60, 60), (100, 100, 150, 150), (200, 200, 260, 260)
+    gts = np.array([[2, *A], [3, *B], [0, *C]], dtype=float)
+    preds = np.array([[*A, 0.90, 1],                     # crack seen as CUTTING (exact box)
+                      [12, 12, 62, 62, 0.50, 2],         # duplicate, labelled crack, slightly shifted
+                      [*B, 0.80, 3],                     # hole correct
+                      [300, 300, 340, 340, 0.60, 1]],    # false positive (cutting, nothing there)
+                     dtype=float)
+    native = build_confusion(preds, gts, [0, 1, 2, 3], 4)
+    assert native[2, 1] == 1 and native[3, 3] == 1 and native[0, 4] == 1       # crack->cutting, hole ok, oil missed
+    assert native[4, 2] == 1 and native[4, 1] == 1                              # unmatched dup (crack) + FP (cutting)
+    assert native.sum() == 3 + 2  # 3 GT rows (matched or missed) + 2 false positives
+    group_of = [1, 2, 2, 0]  # oil->OIL_STAIN(1), cutting/crack->MISSING_THREAD(2), hole->HOLE(0)
+    merged = build_confusion(preds, gts, group_of, 3, nms_iou=0.5)
+    assert merged[2, 2] == 1          # crack detected as cutting is correct once merged
+    assert merged[3, 2] == 1          # only the real FP remains: the duplicate was removed by NMS
+    assert merged[0, 0] == 1 and merged[1, 3] == 1
+    s = summarise_confusion(merged, ["HOLE", "OIL_STAIN", "MISSING_THREAD"])
+    assert s["MISSING_THREAD"]["recall"] == 1.0 and s["MISSING_THREAD"]["precision"] == 0.5
+    assert s["OIL_STAIN"]["recall"] == 0.0 and s["OIL_STAIN"]["missed"] == 1
+    sn = summarise_confusion(native, ["oil", "cutting", "crack", "hole"])
+    assert sn["crack"]["recall"] == 0.0 and sn["crack"]["detected_as_other_class"] == {"cutting": 1}
+
+
+def test_confusion_empty_inputs():
+    from textile_risk.training import build_confusion
+    m = build_confusion(np.zeros((0, 6)), np.zeros((0, 5)), [0, 1], 2)
+    assert m.shape == (3, 3) and m.sum() == 0
+    m = build_confusion(np.zeros((0, 6)), np.array([[1, 0, 0, 10, 10]], dtype=float), [0, 1], 2)
+    assert m[1, 2] == 1 and m.sum() == 1
+
+
+def test_match_one_to_one_prefers_best_iou_and_reports_leftovers():
+    from textile_risk.training import match_one_to_one
+    p = np.array([[0, 0, 10, 10], [1, 1, 11, 11], [50, 50, 60, 60]], dtype=float)
+    g = np.array([[0, 0, 10, 10], [100, 100, 110, 110]], dtype=float)
+    pairs, un_g, un_p = match_one_to_one(p, g, 0.5)
+    assert pairs == [(0, 0)] and un_g == [1] and un_p == [1, 2]
+
+
+def test_review_images_stats_and_annotations(tmp_path):
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from textile_risk.training import review_images
+    imgs, labs = tmp_path / "images", tmp_path / "labels"
+    imgs.mkdir()
+    labs.mkdir()
+    for n in ("a", "b", "c"):
+        Image.new("RGB", (200, 100), (90, 90, 90)).save(imgs / f"{n}.jpg")
+        (labs / f"{n}.txt").write_text("2 0.5 0.5 0.5 0.2\n")   # crack, 100 x 20 px
+    class Fake:
+        def detect(self, path):
+            hit = np.array([[50, 40, 150, 60, 0.9, 2]], dtype=np.float32)       # exact crack
+            wrong = np.array([[50, 40, 150, 60, 0.8, 1]], dtype=np.float32)     # same box, called cutting
+            raw = {"a": hit, "b": np.zeros((0, 6), dtype=np.float32), "c": wrong}[Path(path).stem]
+            return raw, (200, 100)
+    rep = review_images(Fake(), imgs, labs, 2, tmp_path / "out")
+    assert rep["found"]["count"] == 1 and rep["missed_or_wrong_class"]["count"] == 2
+    assert rep["problem_boxes_detected_as"] == {"cutting": 1}
+    assert rep["found"]["median_short_side_px"] == 20.0 and rep["found"]["median_long_side_px"] == 100.0
+    assert rep["found"]["median_area_pct_of_image"] == 10.0
+    assert len(rep["annotated_images"]) == 2 and (tmp_path / "out" / "review.json").exists()
+    bd = rep["problem_breakdown_by_nearest_prediction"]
+    assert bd["no_prediction_in_image"] == 1 and bd["best_iou_at_or_above_threshold(wrong class or box already used)"] == 1
+
+
+def test_review_breakdown_distinguishes_oversized_boxes_from_silence(tmp_path):
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from textile_risk.training import review_images
+    imgs, labs = tmp_path / "images", tmp_path / "labels"
+    imgs.mkdir()
+    labs.mkdir()
+    for n in ("big", "far", "none"):
+        Image.new("RGB", (200, 100), (90, 90, 90)).save(imgs / f"{n}.jpg")
+        (labs / f"{n}.txt").write_text("2 0.5 0.5 0.1 0.2\n")   # GT 20 x 20 px at (90..110, 40..60)
+    class Fake:
+        def detect(self, path):
+            raw = {"big": np.array([[0, 0, 200, 100, 0.4, 2]], dtype=np.float32),   # oversized: IoU = 400/20000 = 0.02
+                   "far": np.array([[0, 0, 20, 20, 0.9, 2]], dtype=np.float32),      # elsewhere: IoU 0
+                   "none": np.zeros((0, 6), dtype=np.float32)}[Path(path).stem]
+            return raw, (200, 100)
+    bd = review_images(Fake(), imgs, labs, 2, tmp_path / "out")["problem_breakdown_by_nearest_prediction"]
+    assert bd == {"best_iou_below_0.1": 2, "no_prediction_in_image": 1}
+
+
+def _label_tree(root: Path) -> Path:
+    """prepared-style labels: sizes are normalised w*h; the TEST split holds a huge box that must not count."""
+    for split, lines in {"train": ["0 0.5 0.5 0.10 0.10", "1 0.5 0.5 0.2 0.1", "2 0.5 0.5 0.3 0.2", "3 0.5 0.5 0.05 0.05",
+                                   "3 0.5 0.5 0.1 0.1"],
+                         "val": ["0 0.5 0.5 0.2 0.2", "1 0.5 0.5 0.1 0.1", "2 0.5 0.5 0.1 0.1"],
+                         "test": ["3 0.5 0.5 0.9 0.9"]}.items():
+        (root / "labels" / split).mkdir(parents=True)
+        (root / "labels" / split / "x.txt").write_text("\n".join(lines) + "\n")
+    (root / "data.yaml").write_text("names:\n  0: oil_stain\n  1: cutting\n  2: crack\n  3: hole\n")
+    return root / "data.yaml"
+
+
+def test_compute_box_limits_uses_only_train_val_and_merges_classes(tmp_path):
+    from textile_risk.training import compute_box_limits
+    rep = compute_box_limits(_label_tree(tmp_path), margin=1.25)
+    nat = rep["native"]
+    assert nat["hole"]["max"] == pytest.approx(0.01) and nat["hole"]["n"] == 2   # test-split 0.81 box ignored
+    assert nat["oil_stain"]["max"] == pytest.approx(0.04) and nat["crack"]["max"] == pytest.approx(0.06)
+    assert nat["crack"]["limit"] == pytest.approx(0.075)
+    # cutting + crack share MISSING_THREAD -> the larger limit wins
+    assert rep["by_defect_type"] == {"OIL_STAIN": pytest.approx(0.05), "MISSING_THREAD": pytest.approx(0.075),
+                                     "HOLE": pytest.approx(0.0125)}
+    assert rep["splits_used"] == ["train", "val"]
+
+
+def test_compute_box_limits_requires_boxes_for_every_class(tmp_path):
+    from textile_risk.training import compute_box_limits
+    yaml = _label_tree(tmp_path)
+    (tmp_path / "labels" / "val" / "x.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    (tmp_path / "labels" / "train" / "x.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+    with pytest.raises(ValueError, match="No labelled boxes"):
+        compute_box_limits(yaml)
+
+
+def test_ingestor_rejects_oversized_boxes_before_nms():
+    geo, cfg = FrameGeometry(width_px=1000, height_px=1000, fabric_width_m=1.0, frame_length_m=1.0), QualityConfig()
+    ing = DetectionIngestor(geo, cfg, {0: DefectType.HOLE}, {DefectType.HOLE: 0.05})
+    raw = np.array([[100, 100, 400, 400, 0.99, 0],    # 300x300 px = 9% of frame > 5% limit -> rejected
+                    [150, 150, 250, 250, 0.60, 0]],   # 1%: would have been suppressed by the big box via NMS
+                   dtype=np.float32)
+    dets = ing.ingest("B", 0, raw)
+    assert len(dets) == 1 and dets[0].confidence == pytest.approx(0.60)
+    assert ing.rejections["oversized_box"] == 1 and ing.rejections["suppressed_by_nms"] == 0
+
+
+def test_confusion_filter_removes_oversized_prediction():
+    from textile_risk.training import build_confusion
+    gts = np.array([[0, 100, 100, 140, 140]], dtype=float)                      # small true box
+    big = np.array([[0, 0, 200, 200, 0.4, 0]], dtype=float)                      # oversized, IoU = 1600/40000 = 0.04
+    m = build_confusion(big, gts, [0], 1)
+    assert m[0, 1] == 1 and m[1, 0] == 1                                          # one miss + one false positive
+    m = build_confusion(big, gts, [0], 1, max_area_frac=[0.05], image_area=200 * 200)
+    assert m[0, 1] == 1 and m[1, 0] == 0                                          # false positive removed
+
+
+def test_pipeline_applies_box_limits_and_reports_rejections(tmp_path, monkeypatch):
+    import textile_risk.detector as det_mod
+    from textile_risk.orchestrator import PlatformConfig, TextileRiskPlatform
+
+    class Fake:
+        class_names = {0: "oil_stain", 1: "cutting", 2: "crack", 3: "hole"}
+
+        def __init__(self, *a, **k):
+            pass
+
+        def detect(self, image_path):
+            return np.array([[0, 0, 900, 900, 0.9, 3], [100, 100, 150, 150, 0.9, 3]], dtype=np.float32), (1000, 1000)
+
+    monkeypatch.setattr(det_mod, "YoloV8Detector", Fake)
+    imgs = tmp_path / "imgs"
+    imgs.mkdir()
+    (imgs / "1.jpg").write_bytes(b"x")
+    w = tmp_path / "w.pt"
+    w.write_bytes(b"x")
+    limits = tmp_path / "limits.json"
+    limits.write_text(json.dumps({"by_defect_type": {"HOLE": 0.1, "OIL_STAIN": 0.2, "MISSING_THREAD": 0.3}}))
+    cfg = PlatformConfig(output_dir=tmp_path / "o", detector="yolo", weights=w, images_dir=imgs,
+                         frame_width_m=1.0, frame_length_m=1.0, box_limits=limits)
+    res = TextileRiskPlatform(cfg).run_image_folder("B-L")
+    assert res["batch_reports"][0].total_defects == 1 and res["ingestion_rejections"]["oversized_box"] == 1

@@ -35,6 +35,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PlatformConfig:
     p.add_argument("--frame-length-m", type=float, help="physical fabric length visible in one image (metres)")
     p.add_argument("--class-map", default="figshare",
                    help="'figshare' or e.g. '0:oil_stain,1:missing_thread,2:ignore,3:hole'")
+    p.add_argument("--box-limits", type=Path, help="box_limits.json: reject implausibly large boxes (see textile-risk-train box-limits)")
     p.add_argument("--detect-conf", type=float, default=0.25)
     p.add_argument("--imgsz", type=int, default=640)
     a = p.parse_args(argv)
@@ -46,7 +47,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PlatformConfig:
                           frequency=a.frequency, min_observations=a.min_observations,
                           detector=a.detector, weights=a.weights, images_dir=a.images_dir,
                           frame_width_m=a.frame_width_m, frame_length_m=a.frame_length_m,
-                          class_map=a.class_map, detect_conf=a.detect_conf, imgsz=a.imgsz)
+                          class_map=a.class_map, detect_conf=a.detect_conf, imgsz=a.imgsz,
+                          box_limits=a.box_limits)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

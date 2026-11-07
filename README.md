@@ -165,8 +165,8 @@ The 99% estimate rests on only 1.8 tail observations because the data is monthly
 1. Clone this repository.
 
 ```bash
-git clone https://github.com/kazimalizaidi/textile-risk-platform.git
-cd textile-risk-platform
+git clone https://github.com/kazimalizaidi/textile-yolov8-cotton-var.git
+cd textile-yolov8-cotton-var
 ```
 
 2. Create an environment and install.

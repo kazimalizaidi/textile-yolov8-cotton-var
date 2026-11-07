@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -28,6 +29,13 @@ class DefectType(IntEnum):
 FIGSHARE_CLASS_NAMES: Dict[int, str] = {0: "oil_stain", 1: "cutting", 2: "crack", 3: "hole"}
 FIGSHARE_CLASS_MAP: Dict[int, "Optional[DefectType]"] = {
     0: DefectType.OIL_STAIN, 1: DefectType.MISSING_THREAD, 2: DefectType.MISSING_THREAD, 3: DefectType.HOLE}
+
+
+def load_box_limits(path: "Path") -> "Dict[DefectType, float]":
+    """Read the by_defect_type section of a box_limits.json (see: textile-risk-train box-limits)."""
+    import json
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {DefectType[name]: float(v) for name, v in data["by_defect_type"].items()}
 
 
 def parse_class_map(text: str) -> "Dict[int, Optional[DefectType]]":
@@ -191,9 +199,12 @@ class DetectionIngestor:
     """Validates, cleans and enriches raw YOLOv8 output into typed Detection objects."""
 
     def __init__(self, geometry: FrameGeometry, config: QualityConfig,
-                 class_map: Optional[Mapping[int, Optional[DefectType]]] = None) -> None:
+                 class_map: Optional[Mapping[int, Optional[DefectType]]] = None,
+                 max_area_fraction: Optional[Mapping[DefectType, float]] = None) -> None:
         self._geo = geometry
         self._cfg = config
+        # largest plausible box (fraction of the frame) per defect type, derived from labelled data
+        self._max_area: Dict[DefectType, float] = dict(max_area_fraction or {})
         # model class id -> DefectType (None = ignore). Default: identity over DefectType ids.
         self._class_map: Dict[int, Optional[DefectType]] = (
             dict(class_map) if class_map is not None else {int(d): d for d in DefectType})
@@ -228,6 +239,10 @@ class DetectionIngestor:
             )
             if box.width < 2.0 or box.height < 2.0:
                 self.rejections["degenerate_box"] += 1
+                continue
+            limit = self._max_area.get(mapped)
+            if limit is not None and box.area / float(self._geo.width_px * self._geo.height_px) > limit:
+                self.rejections["oversized_box"] += 1
                 continue
             candidates.append((mapped, float(conf), box))
 

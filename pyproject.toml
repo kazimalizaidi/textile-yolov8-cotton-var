@@ -7,6 +7,14 @@ name = "textile-risk-platform"
 version = "1.0.0"
 description = "Backend-only textile quality scoring, event-driven supplier hedging and VaR engine"
 readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Kazim Ali Zaidi"}]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Education",
+    "Topic :: Scientific/Engineering",
+]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "pandas>=2.0", "scipy>=1.10"]
 
@@ -20,6 +28,7 @@ dev = ["pytest>=7", "pillow>=10"]
 textile-risk = "textile_risk.cli:main"
 textile-risk-check = "textile_risk.datacheck:main"
 textile-risk-train = "textile_risk.training:main"
+textile-risk-fetch-data = "textile_risk.fetchdata:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

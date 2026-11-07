@@ -117,3 +117,10 @@ def test_mock_client_is_deterministic():
     r1, r2 = (MockSupplierApiClient().request_quote(sup, req) for _ in range(2))
     assert r1["unit_price_usd_per_kg"] == r2["unit_price_usd_per_kg"]
     assert r1["quote_id"] == r2["quote_id"]
+
+
+def test_mock_quote_ids_are_distinct_across_suppliers_and_requests():
+    req = lambda key: {"headers": {"Idempotency-Key": key}, "body": {"urgency_premium": 0.06}}
+    ids = {MockSupplierApiClient().request_quote(s, req(k))["quote_id"] for s in DEFAULT_SUPPLIERS for k in ("a", "b")}
+    assert len(ids) == 2 * len(DEFAULT_SUPPLIERS) and all(i.startswith("Q-") and len(i) == 14 for i in ids)
+    assert not any(i == "Q-000000000000" for i in ids)

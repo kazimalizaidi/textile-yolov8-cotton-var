@@ -209,7 +209,7 @@ class MockSupplierApiClient:
         return {
             "status_code": 201,
             "supplier_id": supplier.supplier_id,
-            "quote_id": f"Q-{uuid.UUID(int=int(rng.integers(0, 2**63 - 1))).hex[:12]}",
+            "quote_id": f"Q-{int(rng.integers(0, 16**12)):012x}",
             "unit_price_usd_per_kg": round(float(quote), 4),
             "lead_time_days": supplier.lead_time_days + int(rng.integers(0, 3)),
             "valid_until": utc_now_iso(),

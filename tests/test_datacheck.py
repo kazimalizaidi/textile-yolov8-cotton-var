@@ -8,6 +8,9 @@ from textile_risk.datacheck import inspect_prices, inspect_yolo_dataset
 from textile_risk.risk import MarketDataProvider, detect_frequency
 
 DATA = Path(__file__).resolve().parents[1] / "data"
+REAL = DATA / "cotton_polyester_monthly_fred.csv"
+# The IMF cotton series is copyrighted, so the CSVs are not in the repository: `python -m textile_risk.fetchdata` creates them.
+needs_real_data = pytest.mark.skipif(not REAL.exists(), reason="run `python -m textile_risk.fetchdata` to download the FRED series first")
 
 
 def _make_yolo(root: Path) -> None:
@@ -48,50 +51,51 @@ def test_detect_frequency():
     assert detect_frequency(pd.date_range("2024-01-01", periods=50, freq="MS")) == "monthly"
 
 
+@needs_real_data
 def test_real_monthly_file_is_loaded_with_aliases_and_detected():
-    md = MarketDataProvider.from_csv(DATA / "cotton_polyester_monthly_fred.csv")
-    assert md.frequency == "monthly" and len(md.prices) == 184
+    md = MarketDataProvider.from_csv(REAL)
+    assert md.frequency == "monthly" and len(md.prices) >= 184  # grows as FRED publishes new months
     assert md.source_columns["cotton_futures"] == "cotton_global_usc_per_lb"
     assert md.source_columns["polyester_spot"] == "polyester_ppi_index"
 
 
+@needs_real_data
 def test_real_data_known_values():
-    """Anchor values copied from the FRED tables (cotton Sep-2026 and polyester Sep-2026, Jun-2011 base)."""
-    df = pd.read_csv(DATA / "cotton_polyester_monthly_fred.csv", parse_dates=["date"]).set_index("date")
+    """Stable historical anchors only (later months are revised or appended): Jun-2011 PPI base and FRED's own annual cotton means."""
+    df = pd.read_csv(REAL, parse_dates=["date"]).set_index("date")
     assert df.loc["2011-06-01", "polyester_ppi_index"] == 100.0
-    assert df.loc["2026-09-01", "polyester_ppi_index"] == pytest.approx(141.426)
-    assert df.loc["2025-12-01", "cotton_global_usc_per_lb"] == pytest.approx(74.065909, abs=1e-5)
-    # FRED's own annual means for the cotton series
-    assert df.loc["2025", "cotton_global_usc_per_lb"].mean() == pytest.approx(77.43511, abs=1e-5)
+    assert df.loc["2021", "cotton_global_usc_per_lb"].mean() == pytest.approx(101.18518, abs=1e-5)
     assert df.loc["2022", "cotton_global_usc_per_lb"].mean() == pytest.approx(130.13901, abs=1e-5)
 
 
+@needs_real_data
 def test_prices_inspector_reports_real_file_limits():
-    rep = inspect_prices(DATA / "cotton_polyester_monthly_fred.csv")
-    assert rep["returns"] == 183 and rep["frequency"] == "monthly" and rep["meets_minimum"]
-    assert rep["tail_observations_99"] == pytest.approx(1.83)
-    assert rep["columns"]["polyester_spot"]["zero_return_share_pct"] > 10  # sticky PPI
-    assert rep["columns"]["cotton_futures"]["annualised_vol_pct"] == pytest.approx(17.18, abs=0.05)
+    rep = inspect_prices(REAL)
+    assert rep["returns"] >= 183 and rep["frequency"] == "monthly" and rep["meets_minimum"]
+    assert rep["tail_observations_99"] >= 1.8 and rep["tail_observations_99"] < 10  # monthly data: 99% tail is thin
+    assert rep["columns"]["polyester_spot"]["zero_return_share_pct"] > 5  # sticky producer price index
+    assert 14 < rep["columns"]["cotton_futures"]["annualised_vol_pct"] < 21
 
 
+@needs_real_data
 def test_pipeline_var_on_real_data_matches_independent_pandas(tmp_path):
     """Recompute 1-month VaR/ES for the real file with plain pandas, bypassing the engine classes."""
     import json
 
     from textile_risk.orchestrator import PlatformConfig, TextileRiskPlatform
     cfg = PlatformConfig(output_dir=tmp_path, data_source="csv",
-                         prices_csv=DATA / "cotton_polyester_monthly_fred.csv")
+                         prices_csv=REAL)
     TextileRiskPlatform(cfg).run_risk_engine()
     got = json.loads((tmp_path / "hedge_config.json").read_text())["risk_metrics"]["baseline_historical"]
 
-    df = pd.read_csv(DATA / "cotton_polyester_monthly_fred.csv", parse_dates=["date"]).set_index("date")
+    df = pd.read_csv(REAL, parse_dates=["date"]).set_index("date")
     r = np.log(df / df.shift(1)).dropna()
     pnl = 2_000_000 * (np.exp(r["cotton_global_usc_per_lb"]) - 1) + 1_500_000 * (np.exp(r["polyester_ppi_index"]) - 1)
     q95, q99 = pnl.quantile(0.05), pnl.quantile(0.01)
     assert got["var_95"] == pytest.approx(-q95, abs=0.01) and got["var_99"] == pytest.approx(-q99, abs=0.01)
     assert got["es_95"] == pytest.approx(-pnl[pnl <= q95].mean(), abs=0.01)
     assert got["es_99"] == pytest.approx(-pnl[pnl <= q99].mean(), abs=0.01)
-    assert got["n_scenarios"] == 183
+    assert got["n_scenarios"] == len(r)
 
 
 def test_alias_missing_column_gives_clear_error(tmp_path):

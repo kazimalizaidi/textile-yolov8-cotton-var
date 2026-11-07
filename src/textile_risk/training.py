@@ -16,9 +16,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
+
 from .common import atomic_write_json
 from .datacheck import IMAGE_EXT, NON_LABEL_STEMS, SPLIT_NAMES, inspect_yolo_dataset, photo_datetime
-from .quality import FIGSHARE_CLASS_NAMES
+from .quality import FIGSHARE_CLASS_MAP, FIGSHARE_CLASS_NAMES, DefectType
 
 LOGGER = logging.getLogger("textile.training")
 CANON_SPLIT = {"train": "train", "valid": "val", "val": "val", "validation": "val", "test": "test"}
@@ -214,6 +216,277 @@ def evaluate_model(weights: Path, data_yaml: Path, split: str = "test", imgsz: i
     return result
 
 
+# ----------------------------------------------------------------------------- confusion analysis
+def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Pairwise IoU of (P,4) and (G,4) xyxy boxes."""
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)))
+    ix = np.clip(np.minimum(a[:, None, 2], b[None, :, 2]) - np.maximum(a[:, None, 0], b[None, :, 0]), 0, None)
+    iy = np.clip(np.minimum(a[:, None, 3], b[None, :, 3]) - np.maximum(a[:, None, 1], b[None, :, 1]), 0, None)
+    inter = ix * iy
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    union = area_a[:, None] + area_b[None, :] - inter
+    return np.where(union > 0, inter / np.where(union > 0, union, 1.0), 0.0)
+
+
+def match_one_to_one(p_box: np.ndarray, g_box: np.ndarray, iou_thr: float) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+    """Greedy one-to-one matching by descending IoU (class-agnostic).
+    Returns (matched (pred_idx, gt_idx) pairs, unmatched gt indices, unmatched pred indices)."""
+    iou = _iou_matrix(p_box, g_box)
+    cands = sorted(((float(iou[i, j]), i, j) for i in range(len(p_box)) for j in range(len(g_box))
+                    if iou[i, j] >= iou_thr), reverse=True)
+    used_p: set = set()
+    used_g: set = set()
+    pairs: List[Tuple[int, int]] = []
+    for _, i, j in cands:
+        if i in used_p or j in used_g:
+            continue
+        used_p.add(i)
+        used_g.add(j)
+        pairs.append((i, j))
+    return pairs, [j for j in range(len(g_box)) if j not in used_g], [i for i in range(len(p_box)) if i not in used_p]
+
+
+def build_confusion(preds: np.ndarray, gts: np.ndarray, group_of: Sequence[int], n_groups: int,
+                    iou_thr: float = 0.5, nms_iou: Optional[float] = None,
+                    max_area_frac: Optional[Sequence[float]] = None, image_area: Optional[float] = None) -> np.ndarray:
+    """Detection confusion matrix for one image.
+
+    preds: (N,6) [x1,y1,x2,y2,conf,cls]; gts: (M,5) [cls,x1,y1,x2,y2]; group_of maps a class id to a
+    group id (identity = native classes, many-to-one = merged classes). Predictions and ground truth are
+    matched one-to-one by descending IoU (>= iou_thr), class-agnostic, so a wrong-class hit shows up as an
+    off-diagonal cell. Returns an (n_groups+1)^2 int matrix: m[true, predicted]; the extra last row counts
+    false positives (no true object), the extra last column counts missed objects. If nms_iou is given,
+    same-group predictions are de-duplicated first (what the pipeline's ingestor does after class mapping)."""
+    bg = n_groups
+    m = np.zeros((n_groups + 1, n_groups + 1), dtype=np.int64)
+    p_box = preds[:, :4].astype(float).reshape(-1, 4)
+    p_conf = preds[:, 4].astype(float)
+    p_grp = np.array([group_of[int(c)] for c in preds[:, 5]], dtype=int)
+    if max_area_frac is not None and image_area and len(p_box):  # drop implausibly large boxes (pipeline behaviour)
+        areas = (p_box[:, 2] - p_box[:, 0]) * (p_box[:, 3] - p_box[:, 1]) / image_area
+        ok = np.array([a <= max_area_frac[g] for a, g in zip(areas, p_grp)], dtype=bool)
+        p_box, p_conf, p_grp = p_box[ok], p_conf[ok], p_grp[ok]
+    if nms_iou is not None and len(p_box):
+        pp = _iou_matrix(p_box, p_box)
+        keep: List[int] = []
+        for i in np.argsort(-p_conf, kind="stable"):
+            if all(not (p_grp[j] == p_grp[i] and pp[i, j] > nms_iou) for j in keep):
+                keep.append(int(i))
+        p_box, p_conf, p_grp = p_box[keep], p_conf[keep], p_grp[keep]
+    g_box = gts[:, 1:5].astype(float).reshape(-1, 4)
+    g_grp = np.array([group_of[int(c)] for c in gts[:, 0]], dtype=int)
+    pairs, un_g, un_p = match_one_to_one(p_box, g_box, iou_thr)
+    for i, j in pairs:
+        m[g_grp[j], p_grp[i]] += 1
+    for j in un_g:
+        m[g_grp[j], bg] += 1
+    for i in un_p:
+        m[bg, p_grp[i]] += 1
+    return m
+
+
+def read_gts(label: Path, w: int, h: int) -> np.ndarray:
+    """YOLO label file -> (M,5) [cls, x1, y1, x2, y2] in pixels for an image of size w x h."""
+    rows: List[List[float]] = []
+    if label.is_file():
+        for line in label.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split()
+            if len(parts) == 5:
+                c, cx, cy, bw, bh = int(float(parts[0])), *(float(v) for v in parts[1:])
+                rows.append([c, (cx - bw / 2) * w, (cy - bh / 2) * h, (cx + bw / 2) * w, (cy + bh / 2) * h])
+    return np.array(rows, dtype=float).reshape(-1, 5)
+
+
+def summarise_confusion(matrix: np.ndarray, labels: Sequence[str]) -> Dict[str, Any]:
+    n = len(labels)
+    out: Dict[str, Any] = {}
+    for c, name in enumerate(labels):
+        tp, true_total, pred_total = int(matrix[c, c]), int(matrix[c, :].sum()), int(matrix[:, c].sum())
+        out[name] = {
+            "true_objects": true_total, "detected_correct_class": tp,
+            "recall": tp / true_total if true_total else None,
+            "precision": tp / pred_total if pred_total else None,
+            "missed": int(matrix[c, n]), "false_positives": int(matrix[n, c]),
+            "detected_as_other_class": {labels[p]: int(matrix[c, p]) for p in range(n) if p != c and matrix[c, p]},
+        }
+    return out
+
+
+def confusion_report(weights: Path, data_yaml: Path, split: str = "test", conf: float = 0.25,
+                     iou_thr: float = 0.5, imgsz: int = 640,
+                     names: Mapping[int, str] = FIGSHARE_CLASS_NAMES,
+                     box_limits: Optional[Path] = None) -> Dict[str, Any]:
+    """Operating-point diagnostics (confidence `conf`, as in the pipeline): native 4-class confusion and the
+    merged project-class confusion (what the quality score actually sees), written to confusion_<split>.json."""
+    from .detector import YoloV8Detector
+    root = data_yaml.parent
+    img_dir, lab_dir = root / "images" / split, root / "labels" / split
+    images = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in IMAGE_EXT)
+    if not images:
+        raise FileNotFoundError(f"No images in {img_dir}")
+    det = YoloV8Detector(weights, conf=conf, imgsz=imgsz)
+    n_native = len(names)
+    native_labels = [names[i] for i in range(n_native)]
+    merged_names = [d.name for d in sorted(DefectType, key=int)]
+    group_of_merged = [int(FIGSHARE_CLASS_MAP[i]) if FIGSHARE_CLASS_MAP.get(i) is not None else -1 for i in range(n_native)]
+    if min(group_of_merged) < 0:
+        raise ValueError("Merged analysis needs every class mapped to a DefectType")
+    native_lim: Optional[List[float]] = None
+    merged_lim: Optional[List[float]] = None
+    if box_limits is not None:
+        lim = json.loads(Path(box_limits).read_text(encoding="utf-8"))
+        native_lim = [float(lim["native"][names[i]]["limit"]) for i in range(n_native)]
+        merged_lim = [float(lim["by_defect_type"][n]) for n in merged_names]
+    m_native = np.zeros((n_native + 1,) * 2, dtype=np.int64)
+    m_merged = np.zeros((len(merged_names) + 1,) * 2, dtype=np.int64)
+    for path in images:
+        raw, (w, h) = det.detect(path)
+        gts = read_gts(lab_dir / f"{path.stem}.txt", w, h)
+        m_native += build_confusion(raw, gts, list(range(n_native)), n_native, iou_thr, max_area_frac=native_lim, image_area=float(w * h))
+        m_merged += build_confusion(raw, gts, group_of_merged, len(merged_names), iou_thr, nms_iou=0.5,
+                                    max_area_frac=merged_lim, image_area=float(w * h))
+    report = {
+        "weights": str(weights), "split": split, "images": len(images), "confidence": conf, "iou_threshold": iou_thr,
+        "box_limits": str(box_limits) if box_limits else None,
+        "matrix_layout": "rows = true class (last row = false positives), columns = predicted class (last column = missed)",
+        "native": {"labels": native_labels + ["background"], "matrix": m_native.tolist(),
+                   "per_class": summarise_confusion(m_native, native_labels)},
+        "merged_project_classes": {"labels": merged_names + ["background"], "matrix": m_merged.tolist(),
+                                   "per_class": summarise_confusion(m_merged, merged_names),
+                                   "note": "cutting+crack merged into MISSING_THREAD with same-class NMS at IoU 0.5, as in the pipeline"},
+    }
+    atomic_write_json(weights.parent / f"confusion_{split}.json", report)
+    return report
+
+
+def compute_box_limits(data_yaml: Path, splits: Sequence[str] = ("train", "val"), margin: float = 1.25,
+                       names: Mapping[int, str] = FIGSHARE_CLASS_NAMES) -> Dict[str, Any]:
+    """Per-class distribution of labelled box areas (fraction of the image = w*h, labels are normalised) and
+    a data-driven upper limit: limit = min(1, margin * largest labelled box of that class). Only the given
+    splits are used (never the test split), so the limit does not leak information from evaluation data."""
+    root = data_yaml.parent
+    areas: Dict[int, List[float]] = {i: [] for i in names}
+    for split in splits:
+        folder = root / "labels" / split
+        if not folder.is_dir():
+            continue
+        for lab in sorted(folder.glob("*.txt")):
+            for line in lab.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) == 5 and int(float(parts[0])) in areas:
+                    areas[int(float(parts[0]))].append(float(parts[3]) * float(parts[4]))
+    native: Dict[str, Any] = {}
+    for cid, vals in areas.items():
+        if not vals:
+            raise ValueError(f"No labelled boxes found for class {names[cid]} in splits {list(splits)}")
+        a = np.array(vals)
+        native[names[cid]] = {"n": len(vals), "p50": float(np.percentile(a, 50)), "p90": float(np.percentile(a, 90)),
+                              "p99": float(np.percentile(a, 99)), "max": float(a.max()),
+                              "limit": float(min(1.0, margin * a.max()))}
+    by_type: Dict[str, float] = {}
+    for cid, name in names.items():
+        mapped = FIGSHARE_CLASS_MAP.get(cid)
+        if mapped is not None:
+            by_type[mapped.name] = max(by_type.get(mapped.name, 0.0), native[name]["limit"])
+    return {"source": str(data_yaml), "splits_used": list(splits), "margin": margin,
+            "unit": "box area as a fraction of image area", "native": native, "by_defect_type": by_type}
+
+
+def _box_stats(items: Sequence[Tuple[float, float, float]]) -> Dict[str, Any]:
+    if not items:
+        return {"count": 0}
+    a = np.array(items, dtype=float)  # columns: short side px, long side px, area % of image
+    return {"count": len(items), "median_short_side_px": float(np.median(a[:, 0])),
+            "median_long_side_px": float(np.median(a[:, 1])),
+            "median_aspect_long_over_short": float(np.median(a[:, 1] / np.maximum(a[:, 0], 1e-9))),
+            "median_area_pct_of_image": float(np.median(a[:, 2]))}
+
+
+def review_images(det: Any, images_dir: Path, labels_dir: Path, target_class: int, out_dir: Path,
+                  names: Mapping[int, str] = FIGSHARE_CLASS_NAMES, iou_thr: float = 0.5,
+                  max_images: int = 40) -> Dict[str, Any]:
+    """For one class, compare found vs missed (or wrong-class) ground-truth boxes and save annotated images
+    of the problem cases: GT of the class in green (missed = thick yellow), predictions in red.
+    `det` needs .detect(path) -> (raw (N,6), (w,h)). Requires Pillow."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required: pip install pillow") from exc
+    images = sorted(p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXT)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    found: List[Tuple[float, float, float]] = []
+    problem: List[Tuple[float, float, float]] = []
+    saved: List[str] = []
+    wrong_class: Counter[str] = Counter()
+    breakdown: Counter[str] = Counter()
+    for path in images:
+        raw, (w, h) = det.detect(path)
+        gts = read_gts(labels_dir / f"{path.stem}.txt", w, h)
+        pairs, _, _ = match_one_to_one(raw[:, :4].astype(float).reshape(-1, 4), gts[:, 1:5], iou_thr)
+        hit = {j for i, j in pairs if int(raw[i, 5]) == target_class and int(gts[j, 0]) == target_class}
+        pred_for = {j: int(raw[i, 5]) for i, j in pairs}
+        bad: List[int] = []
+        for j in range(len(gts)):
+            if int(gts[j, 0]) != target_class:
+                continue
+            bw, bh = gts[j, 3] - gts[j, 1], gts[j, 4] - gts[j, 2]
+            stat = (float(min(bw, bh)), float(max(bw, bh)), 100.0 * float(bw * bh) / (w * h))
+            if j in hit:
+                found.append(stat)
+            else:
+                problem.append(stat)
+                bad.append(j)
+                if j in pred_for:
+                    wrong_class[names.get(pred_for[j], str(pred_for[j]))] += 1
+                # was there ANY prediction near this box, regardless of class or one-to-one matching?
+                best = float(_iou_matrix(raw[:, :4].astype(float).reshape(-1, 4), gts[j:j + 1, 1:5]).max()) if len(raw) else None
+                key = ("no_prediction_in_image" if best is None else "best_iou_below_0.1" if best < 0.1
+                       else "best_iou_0.1_to_0.3" if best < 0.3 else "best_iou_0.3_to_0.5" if best < iou_thr
+                       else "best_iou_at_or_above_threshold(wrong class or box already used)")
+                breakdown[key] += 1
+        if bad and len(saved) < max_images:
+            with Image.open(path) as im:
+                canvas = im.convert("RGB")
+            draw = ImageDraw.Draw(canvas)
+            for j in range(len(gts)):
+                if int(gts[j, 0]) == target_class:
+                    colour, width, tag = ("yellow", 4, "MISSED") if j in bad else ("lime", 2, "GT")
+                    draw.rectangle(gts[j, 1:5].tolist(), outline=colour, width=width)
+                    draw.text((gts[j, 1] + 3, gts[j, 2] + 3), f"{tag} {names.get(target_class, target_class)}", fill=colour)
+            for row in raw:
+                draw.rectangle(row[:4].tolist(), outline="red", width=2)
+                draw.text((row[0] + 3, row[3] - 12), f"{names.get(int(row[5]), int(row[5]))} {row[4]:.2f}", fill="red")
+            target = out_dir / f"{path.stem[:60]}.jpg"
+            canvas.save(target)
+            saved.append(str(target))
+    report = {"class": names.get(target_class, str(target_class)), "iou_threshold": iou_thr,
+              "found": _box_stats(found), "missed_or_wrong_class": _box_stats(problem),
+              "problem_boxes_detected_as": dict(wrong_class), "problem_breakdown_by_nearest_prediction": dict(breakdown),
+              "annotated_images": saved}
+    atomic_write_json(out_dir / "review.json", report)
+    return report
+
+
+def format_confusion(report: Dict[str, Any]) -> str:
+    out = [f"{report['split']}: {report['images']} images, conf >= {report['confidence']}, IoU >= {report['iou_threshold']}"]
+    for key, title in (("native", "NATIVE CLASSES"), ("merged_project_classes", "MERGED (what the quality score sees)")):
+        block = report[key]
+        labels = block["labels"]
+        out.append(f"\n{title}   rows = true, columns = predicted")
+        out.append(" " * 16 + "".join(f"{l[:13]:>14}" for l in labels))
+        for i, row in enumerate(block["matrix"]):
+            name = labels[i] if i < len(labels) - 1 else "(false pos.)"
+            out.append(f"{name:<16}" + "".join(f"{v:>14}" for v in row))
+        for name, st in block["per_class"].items():
+            rec = "n/a" if st["recall"] is None else f"{st['recall']:.3f}"
+            pre = "n/a" if st["precision"] is None else f"{st['precision']:.3f}"
+            other = f"  confused with {st['detected_as_other_class']}" if st["detected_as_other_class"] else ""
+            out.append(f"  {name:<14} true={st['true_objects']:<4} recall={rec}  precision={pre}  missed={st['missed']}  false_pos={st['false_positives']}{other}")
+    return "\n".join(out)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     p = argparse.ArgumentParser(description="Prepare, train and evaluate the fabric-defect YOLOv8 model")
@@ -230,7 +503,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     e_ = sub.add_parser("eval"); e_.add_argument("--weights", type=Path, required=True)
     e_.add_argument("--data", type=Path, required=True); e_.add_argument("--split", default="test")
     e_.add_argument("--imgsz", type=int, default=640); e_.add_argument("--device", default=None)
+    c_ = sub.add_parser("confusion", help="confusion matrices at the pipeline's confidence (native + merged classes)")
+    c_.add_argument("--weights", type=Path, required=True); c_.add_argument("--data", type=Path, required=True)
+    c_.add_argument("--split", default="test"); c_.add_argument("--conf", type=float, default=0.25)
+    c_.add_argument("--iou", type=float, default=0.5); c_.add_argument("--imgsz", type=int, default=640)
+    c_.add_argument("--box-limits", type=Path, default=None, help="apply the oversized-box filter from box_limits.json")
+    r_ = sub.add_parser("review", help="save annotated images of missed/wrong-class boxes for one class + size statistics")
+    r_.add_argument("--weights", type=Path, required=True); r_.add_argument("--data", type=Path, required=True)
+    r_.add_argument("--class-name", default="crack"); r_.add_argument("--split", default="test")
+    r_.add_argument("--conf", type=float, default=0.25); r_.add_argument("--iou", type=float, default=0.5)
+    r_.add_argument("--imgsz", type=int, default=640); r_.add_argument("--max-images", type=int, default=40)
+    r_.add_argument("--out", type=Path, default=None)
+    b_ = sub.add_parser("box-limits", help="derive per-class maximum plausible box area from labelled data")
+    b_.add_argument("--data", type=Path, required=True); b_.add_argument("--margin", type=float, default=1.25)
+    b_.add_argument("--out", type=Path, default=Path("box_limits.json"))
     a = p.parse_args(argv)
+    if a.cmd == "box-limits":
+        rep = compute_box_limits(a.data, margin=a.margin)
+        atomic_write_json(a.out, rep)
+        for name, st in rep["native"].items():
+            print(f"{name:<10} n={st['n']:<4} p50={st['p50']*100:5.2f}%  p90={st['p90']*100:5.2f}%  p99={st['p99']*100:5.2f}%  max={st['max']*100:5.2f}%  limit={st['limit']*100:5.2f}%")
+        print(f"by defect type: { {k: round(v*100, 2) for k, v in rep['by_defect_type'].items()} } (% of image)  -> {a.out}")
+        return 0
+    if a.cmd == "review":
+        from .detector import YoloV8Detector
+        inv = {v: k for k, v in FIGSHARE_CLASS_NAMES.items()}
+        if a.class_name not in inv:
+            raise SystemExit(f"--class-name must be one of {sorted(inv)}")
+        root = a.data.parent
+        rep = review_images(YoloV8Detector(a.weights, conf=a.conf, imgsz=a.imgsz), root / "images" / a.split,
+                            root / "labels" / a.split, inv[a.class_name], a.out or Path(f"review_{a.class_name}"),
+                            iou_thr=a.iou, max_images=a.max_images)
+        print(json.dumps({k: rep[k] for k in ("class", "iou_threshold", "found", "missed_or_wrong_class", "problem_boxes_detected_as", "problem_breakdown_by_nearest_prediction")}, indent=2))
+        print(f"{len(rep['annotated_images'])} annotated images saved; open the folder and look at them.")
+        return 0
+    if a.cmd == "confusion":
+        print(format_confusion(confusion_report(a.weights, a.data, a.split, a.conf, a.iou, a.imgsz, box_limits=a.box_limits)))
+        return 0
     if a.cmd == "prepare":
         rep = prepare_dataset(a.src, a.dst, overwrite=a.overwrite, holdout_dates=a.holdout_date)
         print(json.dumps({k: rep[k] for k in ("images_kept", "dropped_duplicates", "holdout_dates", "per_split", "box_reconciliation")}, indent=2))

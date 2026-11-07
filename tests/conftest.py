@@ -1,4 +1,3 @@
-import numpy as np
 import pytest
 
 from textile_risk.quality import FrameGeometry, QualityConfig

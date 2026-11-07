@@ -1,7 +1,7 @@
 import json
 
 from textile_risk.cli import parse_args
-from textile_risk.orchestrator import BatchSpec, PlatformConfig, TextileRiskPlatform
+from textile_risk.orchestrator import PlatformConfig, TextileRiskPlatform
 
 
 def test_end_to_end_run_creates_all_artefacts(tmp_path):

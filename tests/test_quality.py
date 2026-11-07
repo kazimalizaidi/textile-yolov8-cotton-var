@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from textile_risk.quality import (BatchQualityScorer, BoundingBox, DefectType, Detection,
-                                  DetectionIngestor, QualityConfig, YoloV8Simulator)
+                                  DetectionIngestor, YoloV8Simulator)
 
 
 def _row(x1, y1, x2, y2, conf, cls):
