@@ -6,7 +6,7 @@
 ![SciPy](https://img.shields.io/badge/SciPy-Scientific_Computing-8CAAE6?style=flat-square&logo=scipy&logoColor=white)
 ![Deep Learning](https://img.shields.io/badge/Deep_Learning-Quality_Engine-6A5ACD?style=flat-square&logo=pytorch&logoColor=white)
 ![YOLOv8](https://img.shields.io/badge/YOLOv8-Defect_Detection-00A6A6?style=flat-square&logo=ultralytics&logoColor=white)
-![Backend](https://img.shields.io/badge/Backend-Engineering-374151?style=flat-square&logo=fastapi&logoColor=white)
+![Backend](https://img.shields.io/badge/Backend-Engineering-374151?style=flat-square&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-2E7D32?style=flat-square)
 
 ---
