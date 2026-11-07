@@ -13,7 +13,7 @@
 
 # 📖 Project Overview
 
-An industrial-grade, automated backend pipeline integrating deep learning computer vision, real-time event-driven orchestration, and quantitative market risk hedging. 
+An end-to-end textile intelligence platform combining YOLOv8 defect detection, event-driven quality automation, quantitative VaR/ES risk analysis, tariff stress testing, and linear-programming-based hedging optimization. 
 It combines three modules:
 
 1. **🔍 Deep Learning Quality Engine** - ingests YOLOv8 fabric-defect detections (holes, oil stains, cracks/cuts), scores each
